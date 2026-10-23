@@ -1,46 +1,9 @@
-
-name: NERO INTEL News Bot
-
-on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-concurrency:
-  group: nero-intel-news
-  cancel-in-progress: false
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run news bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python bot.py
-
       - name: Save posting state
         run: |
           git config user.name "nero-intel-bot"
           git config user.email "nero-intel-bot@users.noreply.github.com"
           git add state.json
-          git diff --cached --quiet || git commit -m "Update news bot state"
-          git push
+          git diff --cached --quiet && exit 0
+          git commit -m "Update news bot state"
+          git pull --rebase origin main
+          git push origin main
