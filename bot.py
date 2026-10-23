@@ -1,4 +1,3 @@
-
 import os
 import json
 import random
@@ -23,11 +22,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MIN_HOURS = 1
 MAX_HOURS = 30
 MAX_HISTORY = 1000
+RETRY_MINUTES = 30
 
-# هل التشغيل يدوي من GitHub Actions؟
 MANUAL_RUN = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
-# مصادر الأخبار حسب التصنيف
+# مصادر الأخبار
 FEEDS = [
     ("AI", "TechCrunch AI",
      "https://techcrunch.com/category/artificial-intelligence/feed/"),
@@ -51,6 +50,28 @@ FEEDS = [
 
 HEADERS = {
     "User-Agent": "NERO-INTEL-NewsBot/1.0"
+}
+
+# التصنيفات بالعربية
+CATEGORIES_AR = {
+    "AI": "الذكاء الاصطناعي وصناعة الفيديو",
+    "CYBER": "الأمن السيبراني",
+    "LEAKS": "التسريبات التقنية",
+    "VULN": "الثغرات الأمنية",
+    "TOOLS": "الأدوات التقنية",
+}
+
+# أسماء المصادر بصياغة مناسبة للمنشور العربي
+SOURCES_AR = {
+    "TechCrunch AI": "تك كرانش - الذكاء الاصطناعي",
+    "Hugging Face": "Hugging Face",
+    "Google AI": "Google AI",
+    "The Hacker News": "The Hacker News",
+    "BleepingComputer": "BleepingComputer",
+    "Krebs on Security": "Krebs on Security",
+    "CISA Advisories": "وكالة الأمن السيبراني الأمريكية CISA",
+    "TSEC Threat News": "TSEC",
+    "Hacker News": "Hacker News",
 }
 
 
@@ -115,9 +136,12 @@ def fetch_news():
     for category, source, url in FEEDS:
         try:
             response = requests.get(
-                url, headers=HEADERS, timeout=20
+                url,
+                headers=HEADERS,
+                timeout=20
             )
             response.raise_for_status()
+
             parsed = feedparser.parse(response.content)
 
             for entry in parsed.entries[:30]:
@@ -126,11 +150,12 @@ def fetch_news():
                 ).strip()
 
                 link = entry.get("link", "").strip()
-                summary = entry.get("summary", "")
+
+                raw_summary = entry.get("summary", "")
                 summary = html.unescape(
-                    re.sub(r"<[^>]+>", " ", summary)
+                    re.sub(r"<[^>]+>", " ", raw_summary)
                 )
-                summary = " ".join(summary.split())[:700]
+                summary = " ".join(summary.split())[:1500]
 
                 if not title or not link.startswith("https://"):
                     continue
@@ -158,6 +183,7 @@ def fetch_news():
         except Exception as exc:
             print(f"Feed error [{source}]: {exc}")
 
+    # إزالة الأخبار المكررة القادمة من المصادر المختلفة
     unique = {}
     for item in results:
         unique[item["id"]] = item
@@ -167,86 +193,156 @@ def fetch_news():
 
 
 def summarize_with_gemini(item):
+    """
+    ترجمة عنوان الخبر وكتابة ملخص عربي.
+    ترجع قاموسًا يحتوي على title_ar و summary_ar،
+    أو None عند فشل الترجمة.
+    """
     if not GEMINI_API_KEY:
+        print("GEMINI_API_KEY is missing. Arabic translation unavailable.")
         return None
 
-    try:
-        endpoint = (
-            "https://generativelanguage.googleapis.com/"
-            "v1beta/models/gemini-2.5-flash:generateContent"
-        )
+    endpoint = (
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/models/gemini-2.5-flash:generateContent"
+    )
 
-        prompt = f"""
-اكتب ملخصًا عربيًا واضحًا لخبر تقني.
-لا تتجاوز 3 جمل.
-استعمل المصطلحات الإنجليزية المهمة عند الحاجة.
-لا تضف معلومات غير موجودة في النص.
-إذا كان الخبر مجرد ادعاء أو تسريب غير مؤكد،
-وضّح أنه غير مؤكد ولا تعرضه كحقيقة.
+    prompt = f"""
+أنت محرر أخبار متخصص لقناة NERO INTEL.
 
-العنوان: {item['title']}
-المصدر: {item['source']}
-النص: {item['summary']}
-الرابط: {item['link']}
+المطلوب كتابة منشور إخباري باللغة العربية الفصحى فقط.
+
+التزم بما يلي:
+1. ترجم عنوان الخبر إلى عنوان عربي واضح ودقيق.
+2. اكتب ملخصًا عربيًا من جملتين إلى أربع جمل.
+3. اكتب بالعربية، ولا تترك العنوان أو الملخص باللغة الإنجليزية.
+4. يمكن إبقاء أسماء الشركات والمنتجات والأدوات الرسمية كما هي،
+   مثل Google وOpenAI وChatGPT وKali Linux.
+5. لا تترجم أسماء المنتجات ترجمة حرفية خاطئة.
+6. لا تضف أي معلومة غير موجودة في المصدر.
+7. إذا كان الخبر تسريبًا أو ادعاءً غير مؤكد، وضّح ذلك صراحة.
+8. لا تدّعِ أن معلومة مؤكدة إذا كان المصدر لا يثبتها.
+9. أعد النتيجة بصيغة JSON صحيحة فقط، دون Markdown أو شرح إضافي.
+
+الصيغة المطلوبة:
+{{
+  "title_ar": "عنوان الخبر بالعربية",
+  "summary_ar": "ملخص الخبر باللغة العربية"
+}}
+
+عنوان المصدر:
+{item['title']}
+
+اسم المصدر:
+{item['source']}
+
+نص المصدر:
+{item['summary']}
+
+رابط المصدر:
+{item['link']}
 """
 
+    try:
         response = requests.post(
             endpoint,
             params={"key": GEMINI_API_KEY},
             json={
                 "contents": [{
                     "parts": [{"text": prompt}]
-                }]
+                }],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "responseMimeType": "application/json"
+                }
             },
-            timeout=30
+            timeout=40
         )
+
         response.raise_for_status()
         data = response.json()
 
-        return data["candidates"][0]["content"][
-            "parts"
-        ][0]["text"].strip()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print("Gemini returned no candidates.")
+            return None
+
+        parts = candidates[0].get(
+            "content", {}
+        ).get("parts", [])
+
+        if not parts or not parts[0].get("text"):
+            print("Gemini returned an empty response.")
+            return None
+
+        raw_text = parts[0]["text"].strip()
+
+        # إزالة علامات Markdown إذا أضافها النموذج
+        raw_text = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            raw_text,
+            flags=re.IGNORECASE
+        ).strip()
+
+        result = json.loads(raw_text)
+
+        title_ar = str(
+            result.get("title_ar", "")
+        ).strip()
+
+        summary_ar = str(
+            result.get("summary_ar", "")
+        ).strip()
+
+        if not title_ar or not summary_ar:
+            print("Arabic title or summary is missing.")
+            return None
+
+        return {
+            "title_ar": title_ar,
+            "summary_ar": summary_ar
+        }
 
     except Exception as exc:
-        print(f"Gemini fallback: {exc}")
+        print(f"Arabic translation failed: {exc}")
         return None
 
 
-def fallback_summary(item):
-    if item["summary"]:
-        return item["summary"][:500]
-
-    return (
-        "يتناول هذا الخبر تطورًا تقنيًا جديدًا. "
-        "افتح المصدر الأصلي للاطلاع على التفاصيل."
+def category_name(category):
+    return CATEGORIES_AR.get(
+        category,
+        "أخبار التقنية"
     )
 
 
-def category_name(category):
-    return {
-        "AI": "الذكاء الاصطناعي وAI Video",
-        "CYBER": "الأمن السيبراني وCybersecurity",
-        "LEAKS": "التسريبات التقنية",
-        "VULN": "الثغرات الأمنية",
-        "TOOLS": "الأدوات التقنية"
-    }.get(category, "أخبار التقنية")
+def make_message(item, translated):
+    title = translated["title_ar"]
+    summary = translated["summary_ar"]
 
+    category = category_name(item["category"])
+    source = SOURCES_AR.get(
+        item["source"],
+        item["source"]
+    )
 
-def make_message(item, summary):
-    return (
-        "NERO INTEL | INTELLIGENCE REPORT\n\n"
-        f"التصنيف: {category_name(item['category'])}\n\n"
-        f"{item['title']}\n\n"
-        f"الملخص:\n{summary}\n\n"
-        f"المصدر: {item['source']}\n"
-        f"الرابط الأصلي:\n{item['link']}\n\n"
-        "#NERO_INTEL #TechNews"
-    )[:4000]
+    message = (
+        "🛡️ نيرو إنتل | تقرير استخباراتي تقني\n\n"
+        f"📂 التصنيف: {category}\n\n"
+        f"📰 {title}\n\n"
+        f"📌 الملخص:\n{summary}\n\n"
+        f"🌐 المصدر: {source}\n"
+        f"🔗 رابط الخبر الأصلي:\n{item['link']}\n\n"
+        "#نيرو_إنتل #أخبار_التقنية"
+    )
+
+    # حد Telegram الأقصى للرسالة 4096 حرفًا
+    return message[:4000]
 
 
 def send_telegram(message):
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{BOT_TOKEN}/sendMessage"
     )
 
@@ -264,23 +360,35 @@ def send_telegram(message):
     data = response.json()
 
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram error: {data}")
+        raise RuntimeError(
+            f"Telegram error: {data}"
+        )
 
     return data
+
+
+def schedule_retry(state, minutes=RETRY_MINUTES):
+    state["next_post_at"] = iso(
+        now_utc() + timedelta(minutes=minutes)
+    )
+    save_state(state)
 
 
 def main():
     state = load_state()
     now = now_utc()
 
-    # أول تشغيل: التشغيل اليدوي يحاول النشر فورًا
+    # التشغيل الأول
     if not state.get("initialized"):
         state["initialized"] = True
 
         if not MANUAL_RUN:
             state["next_post_at"] = iso(
                 now + timedelta(
-                    hours=random.randint(MIN_HOURS, MAX_HOURS)
+                    hours=random.randint(
+                        MIN_HOURS,
+                        MAX_HOURS
+                    )
                 )
             )
             save_state(state)
@@ -289,18 +397,17 @@ def main():
 
         state["next_post_at"] = iso(now)
         save_state(state)
-        print("Initialized by manual run. Trying to post now.")
+        print("Initialized by manual run.")
 
-    # التشغيل التلقائي يحترم الموعد؛ اليدوي يتجاوز الانتظار
+    # التشغيل اليدوي يتجاوز موعد الانتظار
     due = state.get("next_post_at")
 
-    if (
-        due
-        and now < datetime.fromisoformat(due)
-        and not MANUAL_RUN
-    ):
-        print(f"Waiting until {due}")
-        return
+    if due and not MANUAL_RUN:
+        due_time = datetime.fromisoformat(due)
+
+        if now < due_time:
+            print(f"Waiting until {due}")
+            return
 
     if MANUAL_RUN:
         print("Manual run: schedule wait bypassed.")
@@ -314,17 +421,15 @@ def main():
     ]
 
     if not candidates:
-        print("No fresh, unposted stories. Retry next check.")
-        state["next_post_at"] = iso(
-            now_utc() + timedelta(minutes=30)
-        )
-        save_state(state)
+        print("No fresh, unposted stories.")
+        schedule_retry(state)
         return
 
-    # اختيار تصنيف ثم خبر عشوائي منه
+    # اختيار تصنيف ثم خبر غير مكرر
     available_categories = list({
         item["category"] for item in candidates
     })
+
     category = random.choice(available_categories)
 
     choices = [
@@ -334,27 +439,39 @@ def main():
 
     item = random.choice(choices)
 
-    summary = summarize_with_gemini(item)
-    if not summary:
-        summary = fallback_summary(item)
+    # لا ننشر الخبر إذا تعذرت ترجمته
+    translated = summarize_with_gemini(item)
 
-    message = make_message(item, summary)
+    if not translated:
+        print("Skipped: Arabic translation was unsuccessful.")
+        schedule_retry(state)
+        return
 
-    # حفظ الخبر في السجل فقط بعد نجاح الإرسال
-    send_telegram(message)
+    message = make_message(item, translated)
+
+    # نسجل الخبر بعد نجاح الإرسال فقط
+    try:
+        send_telegram(message)
+    except Exception as exc:
+        print(f"Telegram send failed: {exc}")
+        schedule_retry(state)
+        raise
 
     posted.add(item["id"])
     state["posted"] = list(posted)[-MAX_HISTORY:]
 
     state["next_post_at"] = iso(
         now_utc() + timedelta(
-            hours=random.randint(MIN_HOURS, MAX_HOURS)
+            hours=random.randint(
+                MIN_HOURS,
+                MAX_HOURS
+            )
         )
     )
 
     save_state(state)
 
-    print(f"Posted: {item['title']}")
+    print(f"Posted Arabic news: {translated['title_ar']}")
     print(f"Next target: {state['next_post_at']}")
 
 
