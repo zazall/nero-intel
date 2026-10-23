@@ -5,6 +5,7 @@ import random
 import hashlib
 import html
 import time
+import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -23,7 +24,10 @@ MIN_HOURS = 1
 MAX_HOURS = 30
 MAX_HISTORY = 1000
 
-# المصادر موزعة حسب التصنيف
+# هل التشغيل يدوي من GitHub Actions؟
+MANUAL_RUN = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+# مصادر الأخبار حسب التصنيف
 FEEDS = [
     ("AI", "TechCrunch AI",
      "https://techcrunch.com/category/artificial-intelligence/feed/"),
@@ -49,14 +53,18 @@ HEADERS = {
     "User-Agent": "NERO-INTEL-NewsBot/1.0"
 }
 
+
 def now_utc():
     return datetime.now(timezone.utc)
+
 
 def iso(dt):
     return dt.isoformat()
 
+
 def parse_date(entry):
     value = entry.get("published") or entry.get("updated")
+
     if value:
         try:
             dt = parsedate_to_datetime(value)
@@ -78,12 +86,13 @@ def parse_date(entry):
 
     return now_utc()
 
+
 def load_state():
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text("utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"State read error: {exc}")
 
     return {
         "posted": [],
@@ -91,11 +100,13 @@ def load_state():
         "initialized": False
     }
 
+
 def save_state(state):
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+
 
 def fetch_news():
     results = []
@@ -117,9 +128,7 @@ def fetch_news():
                 link = entry.get("link", "").strip()
                 summary = entry.get("summary", "")
                 summary = html.unescape(
-                    __import__("re").sub(
-                        r"<[^>]+>", " ", summary
-                    )
+                    re.sub(r"<[^>]+>", " ", summary)
                 )
                 summary = " ".join(summary.split())[:700]
 
@@ -128,7 +137,6 @@ def fetch_news():
 
                 published = parse_date(entry)
 
-                # لا نختار خبرًا قديمًا جدًا
                 if published < cutoff:
                     continue
 
@@ -150,18 +158,18 @@ def fetch_news():
         except Exception as exc:
             print(f"Feed error [{source}]: {exc}")
 
-    # حذف التكرار داخل الأخبار المجمعة
     unique = {}
     for item in results:
         unique[item["id"]] = item
 
+    print(f"Fetched {len(unique)} unique stories.")
     return list(unique.values())
+
 
 def summarize_with_gemini(item):
     if not GEMINI_API_KEY:
         return None
 
-    # النموذج اختياري؛ إذا فشل نرجع للملخص البديل
     try:
         endpoint = (
             "https://generativelanguage.googleapis.com/"
@@ -203,15 +211,16 @@ def summarize_with_gemini(item):
         print(f"Gemini fallback: {exc}")
         return None
 
+
 def fallback_summary(item):
-    summary = item["summary"]
-    if summary:
-        return summary[:500]
+    if item["summary"]:
+        return item["summary"][:500]
 
     return (
         "يتناول هذا الخبر تطورًا تقنيًا جديدًا. "
         "افتح المصدر الأصلي للاطلاع على التفاصيل."
     )
+
 
 def category_name(category):
     return {
@@ -222,8 +231,8 @@ def category_name(category):
         "TOOLS": "الأدوات التقنية"
     }.get(category, "أخبار التقنية")
 
+
 def make_message(item, summary):
-    # نعرض البيانات كنص عادي لتفادي مشاكل HTML
     return (
         "NERO INTEL | INTELLIGENCE REPORT\n\n"
         f"التصنيف: {category_name(item['category'])}\n\n"
@@ -233,6 +242,7 @@ def make_message(item, summary):
         f"الرابط الأصلي:\n{item['link']}\n\n"
         "#NERO_INTEL #TechNews"
     )[:4000]
+
 
 def send_telegram(message):
     url = (
@@ -249,34 +259,51 @@ def send_telegram(message):
         },
         timeout=25
     )
-    response.raise_for_status()
 
+    response.raise_for_status()
     data = response.json()
+
     if not data.get("ok"):
         raise RuntimeError(f"Telegram error: {data}")
 
     return data
 
+
 def main():
     state = load_state()
     now = now_utc()
 
-    # أول تشغيل: جهز الموعد فقط ولا تنشر أخبارًا قديمة
+    # أول تشغيل: التشغيل اليدوي يحاول النشر فورًا
     if not state.get("initialized"):
         state["initialized"] = True
-        state["next_post_at"] = iso(
-            now + timedelta(hours=random.randint(
-                MIN_HOURS, MAX_HOURS
-            ))
-        )
-        save_state(state)
-        print("Initialized. First post scheduled.")
-        return
 
+        if not MANUAL_RUN:
+            state["next_post_at"] = iso(
+                now + timedelta(
+                    hours=random.randint(MIN_HOURS, MAX_HOURS)
+                )
+            )
+            save_state(state)
+            print("Initialized. First post scheduled.")
+            return
+
+        state["next_post_at"] = iso(now)
+        save_state(state)
+        print("Initialized by manual run. Trying to post now.")
+
+    # التشغيل التلقائي يحترم الموعد؛ اليدوي يتجاوز الانتظار
     due = state.get("next_post_at")
-    if due and now < datetime.fromisoformat(due):
+
+    if (
+        due
+        and now < datetime.fromisoformat(due)
+        and not MANUAL_RUN
+    ):
         print(f"Waiting until {due}")
         return
+
+    if MANUAL_RUN:
+        print("Manual run: schedule wait bypassed.")
 
     posted = set(state.get("posted", []))
     news = fetch_news()
@@ -288,14 +315,13 @@ def main():
 
     if not candidates:
         print("No fresh, unposted stories. Retry next check.")
-        # نعيد المحاولة بعد 30 دقيقة
         state["next_post_at"] = iso(
-            now + timedelta(minutes=30)
+            now_utc() + timedelta(minutes=30)
         )
         save_state(state)
         return
 
-    # اختيار عشوائي، مع توزيع عادل نسبيًا بين التصنيفات
+    # اختيار تصنيف ثم خبر عشوائي منه
     available_categories = list({
         item["category"] for item in candidates
     })
@@ -307,13 +333,14 @@ def main():
     ]
 
     item = random.choice(choices)
+
     summary = summarize_with_gemini(item)
     if not summary:
         summary = fallback_summary(item)
 
     message = make_message(item, summary)
 
-    # لا نسجل الخبر إلا بعد نجاح الإرسال
+    # حفظ الخبر في السجل فقط بعد نجاح الإرسال
     send_telegram(message)
 
     posted.add(item["id"])
@@ -326,8 +353,10 @@ def main():
     )
 
     save_state(state)
+
     print(f"Posted: {item['title']}")
     print(f"Next target: {state['next_post_at']}")
+
 
 if __name__ == "__main__":
     main()
