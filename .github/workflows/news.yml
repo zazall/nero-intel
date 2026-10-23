@@ -1,10 +1,9 @@
-
 name: NERO INTEL News Bot
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: write
@@ -16,6 +15,7 @@ concurrency:
 jobs:
   run-news-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -38,18 +38,25 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python -u bot.py
 
       - name: Save posting state
+        if: always()
         run: |
+          if [ ! -f state.json ]; then
+            echo "No state file to save."
+            exit 0
+          fi
+
           git config user.name "nero-intel-bot"
           git config user.email "nero-intel-bot@users.noreply.github.com"
           git add state.json
+
           if git diff --cached --quiet; then
             echo "No state changes to save."
             exit 0
           fi
+
           git commit -m "Update news bot state"
           git pull --rebase origin main
           git push origin main
