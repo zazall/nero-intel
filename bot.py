@@ -1,10 +1,10 @@
 import os
 import json
-import random
 import hashlib
 import html
-import time
 import re
+import time
+import calendar
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -15,44 +15,24 @@ import feedparser
 BASE = Path(__file__).parent
 STATE_FILE = BASE / "state.json"
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"].strip()
 
-MIN_HOURS = 1
-MAX_HOURS = 30
 MAX_HISTORY = 1000
-RETRY_MINUTES = 30
+HEADERS = {"User-Agent": "NERO-INTEL-NewsBot/2.0"}
 
-MANUAL_RUN = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
-
-# مصادر الأخبار
 FEEDS = [
-    ("AI", "TechCrunch AI",
-     "https://techcrunch.com/category/artificial-intelligence/feed/"),
-    ("AI", "Hugging Face",
-     "https://huggingface.co/blog/feed.xml"),
-    ("AI", "Google AI",
-     "https://blog.google/technology/ai/rss/"),
-    ("CYBER", "The Hacker News",
-     "https://feeds.feedburner.com/TheHackersNews"),
-    ("CYBER", "BleepingComputer",
-     "https://www.bleepingcomputer.com/feed/"),
-    ("CYBER", "Krebs on Security",
-     "https://krebsonsecurity.com/feed/"),
-    ("VULN", "CISA Advisories",
-     "https://www.cisa.gov/cybersecurity-advisories/all.xml"),
-    ("VULN", "TSEC Threat News",
-     "https://tsec.ai/feed/all.xml"),
-    ("TOOLS", "Hacker News",
-     "https://news.ycombinator.com/rss"),
+    ("AI", "TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("AI", "Hugging Face", "https://huggingface.co/blog/feed.xml"),
+    ("AI", "Google AI", "https://blog.google/technology/ai/rss/"),
+    ("CYBER", "The Hacker News", "https://feeds.feedburner.com/TheHackersNews"),
+    ("CYBER", "BleepingComputer", "https://www.bleepingcomputer.com/feed/"),
+    ("CYBER", "Krebs on Security", "https://krebsonsecurity.com/feed/"),
+    ("VULN", "CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml"),
+    ("VULN", "TSEC Threat News", "https://tsec.ai/feed/all.xml"),
+    ("TOOLS", "Hacker News", "https://news.ycombinator.com/rss"),
 ]
 
-HEADERS = {
-    "User-Agent": "NERO-INTEL-NewsBot/1.0"
-}
-
-# التصنيفات بالعربية
 CATEGORIES_AR = {
     "AI": "الذكاء الاصطناعي وصناعة الفيديو",
     "CYBER": "الأمن السيبراني",
@@ -61,7 +41,6 @@ CATEGORIES_AR = {
     "TOOLS": "الأدوات التقنية",
 }
 
-# أسماء المصادر بصياغة مناسبة للمنشور العربي
 SOURCES_AR = {
     "TechCrunch AI": "تك كرانش - الذكاء الاصطناعي",
     "Hugging Face": "Hugging Face",
@@ -73,6 +52,11 @@ SOURCES_AR = {
     "TSEC Threat News": "TSEC",
     "Hacker News": "Hacker News",
 }
+
+NO_SUMMARY_AR = (
+    "لم يوفّر المصدر ملخصًا كافيًا. "
+    "يمكنك الاطلاع على التفاصيل من رابط الخبر الأصلي."
+)
 
 
 def now_utc():
@@ -96,11 +80,11 @@ def parse_date(entry):
             pass
 
     for key in ("published_parsed", "updated_parsed"):
-        value = entry.get(key)
-        if value:
+        parsed = entry.get(key)
+        if parsed:
             try:
                 return datetime.fromtimestamp(
-                    time.mktime(value), timezone.utc
+                    calendar.timegm(parsed), timezone.utc
                 )
             except Exception:
                 pass
@@ -111,15 +95,16 @@ def parse_date(entry):
 def load_state():
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text("utf-8"))
+            data = json.loads(
+                STATE_FILE.read_text(encoding="utf-8")
+            )
+            if isinstance(data, dict):
+                data.setdefault("posted", [])
+                return data
         except Exception as exc:
             print(f"State read error: {exc}")
 
-    return {
-        "posted": [],
-        "next_post_at": None,
-        "initialized": False
-    }
+    return {"posted": []}
 
 
 def save_state(state):
@@ -136,38 +121,38 @@ def fetch_news():
     for category, source, url in FEEDS:
         try:
             response = requests.get(
-                url,
-                headers=HEADERS,
-                timeout=20
+                url, headers=HEADERS, timeout=20
             )
             response.raise_for_status()
-
             parsed = feedparser.parse(response.content)
 
             for entry in parsed.entries[:30]:
                 title = html.unescape(
-                    entry.get("title", "")
+                    str(entry.get("title", ""))
                 ).strip()
 
-                link = entry.get("link", "").strip()
+                link = str(entry.get("link", "")).strip()
 
-                raw_summary = entry.get("summary", "")
+                raw_summary = str(
+                    entry.get("summary", "")
+                    or entry.get("description", "")
+                )
+
                 summary = html.unescape(
                     re.sub(r"<[^>]+>", " ", raw_summary)
                 )
-                summary = " ".join(summary.split())[:1500]
+                summary = " ".join(summary.split())[:2500]
 
                 if not title or not link.startswith("https://"):
                     continue
 
                 published = parse_date(entry)
-
                 if published < cutoff:
                     continue
 
-                key = entry.get("id") or link
+                normalized_link = link.split("#", 1)[0]
                 uid = hashlib.sha256(
-                    key.encode("utf-8")
+                    normalized_link.encode("utf-8")
                 ).hexdigest()
 
                 results.append({
@@ -177,242 +162,163 @@ def fetch_news():
                     "summary": summary,
                     "source": source,
                     "category": category,
-                    "published": iso(published)
+                    "published": iso(published),
+                    "published_dt": published,
                 })
 
         except Exception as exc:
             print(f"Feed error [{source}]: {exc}")
 
-    # إزالة الأخبار المكررة القادمة من المصادر المختلفة
     unique = {}
+
     for item in results:
-        unique[item["id"]] = item
+        old = unique.get(item["id"])
+        if old is None or item["published_dt"] > old["published_dt"]:
+            unique[item["id"]] = item
 
-    print(f"Fetched {len(unique)} unique stories.")
-    return list(unique.values())
+    news = list(unique.values())
+    news.sort(
+        key=lambda item: item["published_dt"],
+        reverse=True
+    )
+
+    print(f"Fetched {len(news)} unique stories.")
+    return news
 
 
-def summarize_with_gemini(item):
-    """
-    ترجمة عنوان الخبر وكتابة ملخص عربي.
-    ترجع قاموسًا يحتوي على title_ar و summary_ar،
-    أو None عند فشل الترجمة.
-    """
-    if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY is missing. Arabic translation unavailable.")
-        return None
+def translate_to_arabic(text):
+    """ترجمة بدون مفتاح Gemini أو API key."""
+    text = " ".join(str(text or "").split()).strip()
+
+    if not text:
+        return ""
 
     endpoint = (
-        "https://generativelanguage.googleapis.com/"
-        "v1beta/models/gemini-2.5-flash:generateContent"
+        "https://translate.googleapis.com/translate_a/single"
     )
+    last_error = None
 
-    prompt = f"""
-أنت محرر أخبار متخصص لقناة NERO INTEL.
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                endpoint,
+                params={
+                    "client": "gtx",
+                    "sl": "auto",
+                    "tl": "ar",
+                    "dt": "t",
+                    "q": text[:3500],
+                },
+                headers=HEADERS,
+                timeout=25,
+            )
 
-المطلوب كتابة منشور إخباري باللغة العربية الفصحى فقط.
+            response.raise_for_status()
+            data = response.json()
+            chunks = data[0] if data and data[0] else []
 
-التزم بما يلي:
-1. ترجم عنوان الخبر إلى عنوان عربي واضح ودقيق.
-2. اكتب ملخصًا عربيًا من جملتين إلى أربع جمل.
-3. اكتب بالعربية، ولا تترك العنوان أو الملخص باللغة الإنجليزية.
-4. يمكن إبقاء أسماء الشركات والمنتجات والأدوات الرسمية كما هي،
-   مثل Google وOpenAI وChatGPT وKali Linux.
-5. لا تترجم أسماء المنتجات ترجمة حرفية خاطئة.
-6. لا تضف أي معلومة غير موجودة في المصدر.
-7. إذا كان الخبر تسريبًا أو ادعاءً غير مؤكد، وضّح ذلك صراحة.
-8. لا تدّعِ أن معلومة مؤكدة إذا كان المصدر لا يثبتها.
-9. أعد النتيجة بصيغة JSON صحيحة فقط، دون Markdown أو شرح إضافي.
+            translated = "".join(
+                str(chunk[0])
+                for chunk in chunks
+                if isinstance(chunk, list)
+                and chunk
+                and chunk[0]
+            ).strip()
 
-الصيغة المطلوبة:
-{{
-  "title_ar": "عنوان الخبر بالعربية",
-  "summary_ar": "ملخص الخبر باللغة العربية"
-}}
+            if translated:
+                return translated
 
-عنوان المصدر:
-{item['title']}
+            raise ValueError(
+                "Translation service returned empty text."
+            )
 
-اسم المصدر:
-{item['source']}
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"Translation attempt {attempt + 1} failed: {exc}"
+            )
 
-نص المصدر:
-{item['summary']}
+            if attempt == 0:
+                time.sleep(2)
 
-رابط المصدر:
-{item['link']}
-"""
-
-    try:
-        response = requests.post(
-            endpoint,
-            params={"key": GEMINI_API_KEY},
-            json={
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "responseMimeType": "application/json"
-                }
-            },
-            timeout=40
-        )
-
-        response.raise_for_status()
-        data = response.json()
-
-        candidates = data.get("candidates", [])
-        if not candidates:
-            print("Gemini returned no candidates.")
-            return None
-
-        parts = candidates[0].get(
-            "content", {}
-        ).get("parts", [])
-
-        if not parts or not parts[0].get("text"):
-            print("Gemini returned an empty response.")
-            return None
-
-        raw_text = parts[0]["text"].strip()
-
-        # إزالة علامات Markdown إذا أضافها النموذج
-        raw_text = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            raw_text,
-            flags=re.IGNORECASE
-        ).strip()
-
-        result = json.loads(raw_text)
-
-        title_ar = str(
-            result.get("title_ar", "")
-        ).strip()
-
-        summary_ar = str(
-            result.get("summary_ar", "")
-        ).strip()
-
-        if not title_ar or not summary_ar:
-            print("Arabic title or summary is missing.")
-            return None
-
-        return {
-            "title_ar": title_ar,
-            "summary_ar": summary_ar
-        }
-
-    except Exception as exc:
-        print(f"Arabic translation failed: {exc}")
-        return None
+    raise RuntimeError(f"Translation failed: {last_error}")
 
 
-def category_name(category):
-    return CATEGORIES_AR.get(
-        category,
-        "أخبار التقنية"
-    )
+def translate_item(item):
+    title_ar = translate_to_arabic(item["title"])
+
+    if item["summary"].strip():
+        summary_ar = translate_to_arabic(item["summary"])
+    else:
+        summary_ar = NO_SUMMARY_AR
+
+    if not title_ar:
+        raise RuntimeError("Arabic title is empty.")
+
+    if not summary_ar:
+        summary_ar = NO_SUMMARY_AR
+
+    return {
+        "title_ar": title_ar,
+        "summary_ar": summary_ar,
+    }
 
 
 def make_message(item, translated):
-    title = translated["title_ar"]
-    summary = translated["summary_ar"]
+    category = CATEGORIES_AR.get(
+        item["category"], "أخبار التقنية"
+    )
 
-    category = category_name(item["category"])
     source = SOURCES_AR.get(
-        item["source"],
-        item["source"]
+        item["source"], item["source"]
     )
 
     message = (
         "🛡️ نيرو إنتل | تقرير استخباراتي تقني\n\n"
         f"📂 التصنيف: {category}\n\n"
-        f"📰 {title}\n\n"
-        f"📌 الملخص:\n{summary}\n\n"
+        f"📰 {translated['title_ar']}\n\n"
+        f"📌 الملخص:\n{translated['summary_ar']}\n\n"
         f"🌐 المصدر: {source}\n"
         f"🔗 رابط الخبر الأصلي:\n{item['link']}\n\n"
         "#نيرو_إنتل #أخبار_التقنية"
     )
 
-    # حد Telegram الأقصى للرسالة 4096 حرفًا
     return message[:4000]
 
 
 def send_telegram(message):
-    url = (
-        "https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
+    endpoint = (
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     )
 
     response = requests.post(
-        url,
+        endpoint,
         json={
             "chat_id": CHANNEL_ID,
             "text": message,
-            "disable_web_page_preview": False
+            "disable_web_page_preview": False,
         },
-        timeout=25
+        timeout=25,
     )
 
     response.raise_for_status()
     data = response.json()
 
     if not data.get("ok"):
-        raise RuntimeError(
-            f"Telegram error: {data}"
-        )
+        raise RuntimeError(f"Telegram error: {data}")
 
     return data
 
 
-def schedule_retry(state, minutes=RETRY_MINUTES):
-    state["next_post_at"] = iso(
-        now_utc() + timedelta(minutes=minutes)
-    )
-    save_state(state)
-
-
 def main():
     state = load_state()
-    now = now_utc()
+    posted_list = state.get("posted", [])
 
-    # التشغيل الأول
-    if not state.get("initialized"):
-        state["initialized"] = True
+    if not isinstance(posted_list, list):
+        posted_list = []
 
-        if not MANUAL_RUN:
-            state["next_post_at"] = iso(
-                now + timedelta(
-                    hours=random.randint(
-                        MIN_HOURS,
-                        MAX_HOURS
-                    )
-                )
-            )
-            save_state(state)
-            print("Initialized. First post scheduled.")
-            return
+    posted = set(posted_list)
 
-        state["next_post_at"] = iso(now)
-        save_state(state)
-        print("Initialized by manual run.")
-
-    # التشغيل اليدوي يتجاوز موعد الانتظار
-    due = state.get("next_post_at")
-
-    if due and not MANUAL_RUN:
-        due_time = datetime.fromisoformat(due)
-
-        if now < due_time:
-            print(f"Waiting until {due}")
-            return
-
-    if MANUAL_RUN:
-        print("Manual run: schedule wait bypassed.")
-
-    posted = set(state.get("posted", []))
     news = fetch_news()
 
     candidates = [
@@ -421,58 +327,38 @@ def main():
     ]
 
     if not candidates:
-        print("No fresh, unposted stories.")
-        schedule_retry(state)
-        return
-
-    # اختيار تصنيف ثم خبر غير مكرر
-    available_categories = list({
-        item["category"] for item in candidates
-    })
-
-    category = random.choice(available_categories)
-
-    choices = [
-        item for item in candidates
-        if item["category"] == category
-    ]
-
-    item = random.choice(choices)
-
-    # لا ننشر الخبر إذا تعذرت ترجمته
-    translated = summarize_with_gemini(item)
-
-    if not translated:
-        print("Skipped: Arabic translation was unsuccessful.")
-        schedule_retry(state)
-        return
-
-    message = make_message(item, translated)
-
-    # نسجل الخبر بعد نجاح الإرسال فقط
-    try:
-        send_telegram(message)
-    except Exception as exc:
-        print(f"Telegram send failed: {exc}")
-        schedule_retry(state)
-        raise
-
-    posted.add(item["id"])
-    state["posted"] = list(posted)[-MAX_HISTORY:]
-
-    state["next_post_at"] = iso(
-        now_utc() + timedelta(
-            hours=random.randint(
-                MIN_HOURS,
-                MAX_HOURS
-            )
+        print(
+            "No fresh, unposted stories. "
+            "Nothing to publish this run."
         )
+        return
+
+    # يجرب أحدث خمسة أخبار إذا فشلت ترجمة أحدها
+    for item in candidates[:5]:
+        try:
+            translated = translate_item(item)
+        except Exception as exc:
+            print(
+                f"Skipping story because translation failed: {exc}"
+            )
+            continue
+
+        message = make_message(item, translated)
+
+        # لا يسجل الخبر إلا بعد نجاح إرساله إلى Telegram
+        send_telegram(message)
+
+        posted_list.append(item["id"])
+        state["posted"] = posted_list[-MAX_HISTORY:]
+        save_state(state)
+
+        print(f"Posted: {translated['title_ar']}")
+        return
+
+    print(
+        "No story was posted because translation failed "
+        "for the latest candidates."
     )
-
-    save_state(state)
-
-    print(f"Posted Arabic news: {translated['title_ar']}")
-    print(f"Next target: {state['next_post_at']}")
 
 
 if __name__ == "__main__":
